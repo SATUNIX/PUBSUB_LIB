@@ -1,0 +1,760 @@
+#!/usr/bin/env bash
+export LANGUAGE=C LANG=C LC_ALL=C
+# Details: See info and usage functions below
+
+export version="0.3.0 (beta)"
+
+info(){
+  # Brief: Info about ipfs-chat
+  echo -n "
+                        Welcome to ipfs-chat
+                        ====================
+Repo (For details & Bug-report): https://github.com/SomajitDey/ipfs-chat
+License: GNU GPL v3-or-later (C) 2021 Somajit Dey
+Version: " >&2
+  echo "${version}"
+}; export -f info
+
+usage(){
+  # Brief: Show help and exit
+  echo -e "\nUsage: ipfs-chat [-n <nick>] [-r <room>] [-d <file-download-dir>] [-D <max-download-MB>] [-c <ipfs-repo-path>] [-o <chat-log-path>] [-w | -l] [-b]"
+  echo -e "\nNote: -w or -W implies WAN-only connection; -l|-L is LAN-only; To have both WAN & LAN, don't use any of these flags"
+  echo -e "\nVersion: ipfs-chat -v"
+  echo -e "\nUpdate: ipfs-chat -u [<version e.g. v0.2.6> | <branch-name>]"
+  echo -e "\nGenerate random room name: ipfs-chat -g"
+  echo -e "\nEnable shared file extension check against MIME-type: ipfs-chat -e"
+  echo ; exit 1
+} >&2; export -f usage
+
+kill_proc_tree(){
+  # Brief: Kill (with SIGKILL) all descendants of the process id given
+  local pid
+  for pid in $(pgrep -P "${1}"); do
+    kill_proc_tree "${pid}" &
+  done
+  kill -KILL "${1}" 
+} &>/dev/null; export -f kill_proc_tree
+
+sha1(){
+  # Usage: sha1 <string> ##or## sha1 < path_to_data_file
+  local string="${@}"
+  if [[ -n "${string}" ]]; then
+    sha1sum <(echo -n "${string}")
+  else
+    sha1sum 
+  fi | cut -d ' ' -f 1
+} 2>/dev/null; export -f sha1
+
+b64(){
+  # Brief: Inline base64 encode with / replaced by _, and the trailing = dropped
+  # Deleting last = because base64 encoding 160-bit kdf or hmac always gives single =, hence redundant
+  # Substituting / with _ because / messes up using kdf/hmac outputs as directory or filenames
+  # Usage: b64 <hexdump>
+  xxd -r -p | base64 -w0 | tr -d '=' | tr '/' '_'
+} 2>/dev/null; export -f b64
+
+hmac(){
+  # Usage: hmac <salt> <string>
+  # Output: base64, with / replaced by _, and trailing = dropped
+  local key="$(sha1 "${1}")" data="$(sha1 "${2}")"
+  echo -n "${data}" | xxd -r -p | openssl dgst -sha1 -mac hmac -macopt hexkey:"${key}" | cut -d ' ' -f 2 | b64
+} 2>/dev/null; export -f hmac
+
+kdf(){
+  # Usage: kdf <salt> <string>
+  # Output: 160-bit base64 key, with / replaced by _, and the trailing = dropped
+  local key="$(sha1 "${1}")" data="${2}"
+  # No-need to lose `data` bits by prehashing. Hashing `key` ensures argon2 salt is atleast 8 characters long.
+  echo -n "${data}" | argon2 "${key}" -t 3 -m 12 -p 1 -l 20 -r | b64
+} 2>/dev/null; export -f kdf
+
+dep_check(){
+  # Brief: Check major dependencies
+  local ipfs_version quit
+  if ipfs_version=$(ipfs version --number 2>/dev/null); then
+    local req_ipfs_ver=0.11.0 # Minimum ipfs-cli version required
+    [[ "$(echo -e "${ipfs_version}\n${req_ipfs_ver}" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" == "${req_ipfs_ver}" ]] || \
+      { echo -e "Required: go-ipfs-cli version >= ${req_ipfs_ver}\nSuggestion: ipfs update install latest\n"; quit="yes";}
+  else
+    echo -e "Required: go-ipfs-cli\nSource: https://docs.ipfs.io/install/command-line/#linux\n"
+    quit="yes"
+  fi
+  if ! command -v dialog &>/dev/null; then
+    echo -e "Required: dialog\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/dialog\n"
+    quit="yes"
+  fi
+  if ! command -v curl &>/dev/null; then
+    echo -e "Required: curl\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/curl\n"
+    quit="yes"
+  fi
+  if ! command -v flock &>/dev/null; then
+    echo -e "Required: flock\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/flock\n"
+    quit="yes"
+  fi
+  if ! command -v openssl &>/dev/null; then
+    echo -e "Required: openssl\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/openssl\n"
+    quit="yes"
+  fi
+  if ! command -v tput &>/dev/null; then
+    echo -e "Required: tput\nSource: Native package repository"
+    echo -e "Ref: https://command-not-found.com/tput\n"
+    quit="yes"
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo -e "Required: jq\nSource: Native package repository"
+    echo -e "Ref: https://stedolan.github.io/jq/download/\n"
+    quit="yes"
+  fi
+  if ! command -v argon2 &>/dev/null; then
+    echo -e "Required: argon2-cli\nSource: Native package repository / web (pre-compiled binary or build from source)"
+    echo -e "Ref: https://command-not-found.com/argon2"
+    echo -e "Ref: https://github.com/SomajitDey/phc-winner-argon2/releases/download/static-build_linux_x86_64/argon2"
+    echo -e "Ref: https://github.com/P-H-C/phc-winner-argon2\n"
+    quit="yes"
+  fi
+  [[ -v quit ]] && exit 1
+} >&2; export -f dep_check
+
+dep_check
+
+win2lin_path(){
+  # Brief: Convert Windows to Linux path. If Linux path is given, does tilde expansion & quote removal.
+  # Usage: win2lin_path <path> ##or## win2lin_path < file_containing_path
+  # The input can be formatted freely. Path may contain spaces not esacaped by \. Quotes may or may not be used for Win paths
+  local input="${@}"; [[ -n "${input}" ]] || read -r input # Backslash not special due to -r
+  input="${input%/}" # Trailing slash removal, if any
+  if ! [[ "${input}" == ~* ]]; then
+    local quote_less="$(echo "${input//\\/\\\\}" | xargs)" # xargs does quote removal. To save backslash, escaped 'em
+    wslpath "${quote_less}" && return
+  fi
+  eval echo "${input}" # eval does tilde-expansion
+} 2>/dev/null; export -f win2lin_path
+
+update(){
+  # Usage: update [-s <update-from-file-path>] [-d <download-to-file-path>] [git-branch]
+  # Note: If -d, it only downloads the latest version to the given location, doesn't update
+  # Note: If -s, it only updates from the given source
+  local OPTIND=1 opt cli_opt source dest
+  while getopts s:d: opt; do
+    case "${opt}" in
+      s) cli_opt="${opt}"; source="${OPTARG}";;
+      d) cli_opt="${opt}"; dest="${OPTARG}";;
+    esac
+  done
+  local branch="${!OPTIND}"
+  local url="https://raw.githubusercontent.com/SomajitDey/ipfs-chat/${branch:=main}/ipfs-chat"
+  local tmp="$(mktemp)" # Using /tmp instead of tmpdir below as tmpdir won't exist for `ipfs-chat -u`
+  trap "rm -f ${tmp}" return
+  local tags api_url="https://api.github.com/repos/SomajitDey/ipfs-chat/tags"
+  case "${cli_opt}" in
+    s)
+      [[ -x "${source}" ]] || return 1
+      mv -f "${source}" "${BASH_SOURCE}" 2>/dev/null || sudo mv -f "${source}" "${BASH_SOURCE}" && \
+        echo "Update: Updated to v$(${BASH_SOURCE} -v)"
+      ;;
+    d) 
+      if timeout 4 curl -sfNL -o "${tmp}" "${url}"; then 
+        chmod +x "${tmp}" && mv "${tmp}" "${dest}" # Atomic update
+      elif tags="$(timeout 2 curl -sfNL "${api_url}" 2>/dev/null)"; then
+        echo "Error: Couldn't find the requested tag/branch"
+        jq -r '.[].name' <<< "${tags}" | xargs echo "Releases: "
+        return 1
+      else
+        echo "Error: Failed to update. Check internet connection."
+        return 1
+      fi
+      ;;
+    *) 
+      update -d "${tmp}" "${branch}" && update -s "${tmp}"
+      ;;
+  esac
+} >&2; export -f update
+
+parse_cmdline(){
+  local opt OPTIND=1
+  while getopts n:r:d:D:c:gwWlLo:vbeuh opt;do
+    case "${opt}" in
+      n) nick="${OPTARG}";;
+      r) room="${OPTARG}";;
+      d) dldir="$(win2lin_path "${OPTARG}")";;
+      D) max_dl_MB="${OPTARG}";;
+      c) local repo="${OPTARG}";;
+      g) echo -n "Random room: " >&2; dd if=/dev/urandom count=1 bs=6 2>/dev/null | base64 | tr '/' '%'; exit;;
+      w|W) export connect_mode="WAN";;
+      l|L) export connect_mode="LAN";;
+      o) export chat="${OPTARG}";;
+      v) echo "${version}"; exit;;
+      b) export disable_bandwidth_metrics="false";;
+      e) export mime_type_check="enabled";;
+      u) update "${!OPTIND}"; exit "${?}";;
+      h|*) usage;;
+    esac
+  done
+  export room="${room:="Lobby"}" nick="${nick:="${USER}"}"
+
+  export dldir="${dldir:="${HOME}/ipfs-chat-downloads"}" max_dl_MB="${max_dl_MB:=-1}"
+  mkdir -p "${dldir}" 2>/dev/null || { echo "Error: Directory at '${dldir}' could not be created. Exiting." >&2; exit 1;}
+  [[ "${max_dl_MB}" =~ ^[-]?[[:digit:]]+$ ]] || { echo "Error: -D value should be an integer" >&2; exit 1;}
+
+  export IPFS_PATH="${repo:-"${HOME}/.ipfs-chat"}"
+}; export -f parse_cmdline
+
+parse_cmdline "$@"
+
+info
+echo "DL dir: $(tput smso)${dldir}$(tput rmso)" >&2
+echo "Max filesize: $(tput setaf 1)$(((max_dl_MB>=0)) && echo "${max_dl_MB} MB" || echo 'N/A; Use -D flag')$(tput sgr0)" >&2
+
+cache_peer(){
+  # Brief: Cache multiaddress given as argument. The cache will be used by con_cull
+  ipfs swarm peering add "${1}" # Add to peering subsystem (go-ipfs >= v0.10.0) # TODO: Ain't relay protected from ConnMgr?
+  echo "${1}" | grep -o '/p2p/[[:alnum:]]*' | grep -vf "${sess_peers}" | \
+    flock "${sess_peers}" xargs -r -n1 >> "${sess_peers}"
+} &>/dev/null; export -f cache_peer
+
+ipfs_config(){
+  # Brief: Configure IPFS node
+  # Note: Use random ports for everything so that multiple IPFS nodes can coexist on the same machine
+  # Note: Most configs below are for reducing bandwidth/CPU/disk usage
+  echo "Status: Configuring IPFS node..."
+  if [[ "$(ipfs config 'ipfs-chat-version' 2>/dev/null)" != "${version}" ]] || \
+    [[ "$(ipfs config 'App' 2>/dev/null)" != "ipfs-chat" ]]; then
+    (ipfs init --profile lowpower || ipfs config profile apply lowpower \
+      && ipfs config profile apply randomports) &>/dev/null || \
+      { echo "Error: Failed to create IPFS repo at ${IPFS_PATH}"; exit 1;}
+    ipfs config --json Pubsub.Enabled true
+    ipfs config --json Ipns.UsePubsub true
+    ipfs config Pubsub.Router gossipsub
+    ipfs config Ipns.RepublishPeriod 2m0s
+    ipfs config Ipns.RecordLifetime 24h
+    ipfs config Reprovider.Interval 2m0s
+    ipfs config Reprovider.Strategy roots
+    ipfs config Routing.Type dhtclient
+    ipfs config Swarm.ConnMgr.Type none
+    ipfs config --json Experimental.FilestoreEnabled true
+    ipfs config 'ipfs-chat-version' "${version}"
+    ipfs config 'App' "ipfs-chat"
+  fi
+
+  export sess_peers="${IPFS_PATH}/session_peers" # This file caches all ipfs-chat peers (multiaddresses) seen when node is online
+  local prev_sess_peers="$(cat "${sess_peers}" 2>/dev/null)" # Holds peers from last session, if any
+  export sess_uplds="${IPFS_PATH}/session_uploads" # Maps SHA1 hash of file to CID of its hash-encrypted object
+
+  # Repo cleanup when no other instance is running; i.e. node is offline
+  if ! ipfs swarm peers; then
+    rm -rf "${IPFS_PATH}/room#"*
+    rm -f "${sess_peers}" "${sess_uplds}"
+    ipfs pin ls --type=recursive --quiet | xargs -r -n1 -P0 ipfs pin rm # Remove stale pins to destress reprovider
+  fi &>/dev/null # Can't be non-blocking. Otherwise launching IPFS daemon shows, "ERROR: lock ... :someone else has lock"
+
+  export global_fs="${HOME}/.filestore-ipfs-chat"; mkdir -p "${global_fs}"
+  # For multinode deduplication. UL files named after SHA1, DL files after CID  
+  # Cleanup global cache in background when disk usage exceeds 1 GB
+  # ICGFS: IPFS_CHAT_GLOBAL_FILESTORE_SIZE in MB (type: integer)
+  if (("$(du -BM "${global_fs}" | awk '{print $1}' | tr -d M)" > "${ICGFS:=1024}")); then
+    flock -n "${global_fs}" rm -rf "${global_fs}"/*
+  fi &
+  
+  echo "$(tput cuu1; tput ed)Status: Preparing the IPFS config file..."  
+  ipfs config --bool Swarm.DisableBandwidthMetrics "${disable_bandwidth_metrics:-true}"
+  case "${connect_mode}" in
+    LAN)
+      ipfs config profile apply local-discovery &>/dev/null # Revert changes done by Server profile
+      #ipfs config --bool Discovery.MDNS.Enabled true
+      ipfs config --json Addresses.NoAnnounce '[]'
+      ipfs bootstrap rm all &>/dev/null # For faster startup
+      # Disable NAT traversal
+      ipfs config --bool Swarm.DisableNatPortMap true
+      ipfs config --bool Swarm.Transports.Network.Relay false
+      ipfs config --bool Swarm.RelayClient.Enabled false
+      ipfs config --bool Swarm.EnableHolePunching false
+      ;;
+    WAN | *)
+      if [[ "${connect_mode}" == WAN ]]; then
+        ipfs config profile apply server &>/dev/null
+        # Server profile disables swarm connecting to private IPs. Doesn't announce own private IPs. Disables MDNS discovery
+        #ipfs config --bool Discovery.MDNS.Enabled false
+        ipfs config show | \
+        jq '.Addresses.NoAnnounce += ["/ip4/127.0.0.1/ipcidr/1", "/ip6/::1/ipcidr/1"]' > "${IPFS_PATH}"/.config && \
+        ipfs config replace "${IPFS_PATH}"/.config
+      else
+        ipfs config profile apply local-discovery &>/dev/null # Revert changes done by Server profile
+        #ipfs config --bool Discovery.MDNS.Enabled true
+        ipfs config --json Addresses.NoAnnounce '[]'
+      fi
+      ipfs bootstrap add default &>/dev/null # For WAN-DHT
+      # For NAT traversal
+      ipfs config --bool Swarm.DisableNatPortMap false
+      ipfs config --bool Swarm.Transports.Network.Relay true
+      ipfs config --bool Swarm.RelayClient.Enabled true
+      ipfs config --bool Swarm.EnableHolePunching true
+      ;;
+  esac
+  # Disable RelayService. This config is given last as server profile in WAN mode turns it on
+  ipfs config --bool Swarm.RelayService.Enabled false
+  rm -f "${IPFS_PATH}/config-pre-"* # Remove config backup files generated with `ipfs config profile apply`
+
+  echo "$(tput cuu1; tput ed)Status: Configuring ports..."
+  pscan(){
+    # Brief: Give an unused, random, local TCP port except the one passed as argument
+    local port except="${1}"
+    while port="$(( 0x"$(dd if=/dev/urandom bs=2 count=1 2> /dev/null | xxd -p)" - 1 ))";do
+      ((port!=except)) || continue
+      nc -z localhost "${port}" || break
+    done
+    echo "${port}"
+  } 2>/dev/null; export -f pscan
+  local API_port="$(pscan)"; ipfs config Addresses.API "/ip4/127.0.0.1/tcp/${API_port:=5001}"
+  local gateway_port="$(pscan "${API_port}")"; ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/${gateway_port:=8080}"
+
+  echo "$(tput cuu1; tput ed)Status: Getting node online (launching IPFS daemon)..."
+  launch_ipfs(){
+    # Brief: Launch IPFS daemon in the background, if not already running. Reflect online status through exit code
+    ipfs swarm peers || \
+      [[ "$(flock -s "${global_fs}" ipfs daemon ${@} | grep -iom1 'Daemon is ready' &)" ]]
+  } &>/dev/null; export -f launch_ipfs
+
+  if launch_ipfs ; then
+    echo "$(tput cuu1; tput ed)Status: IPFS node is configured"
+  else
+    echo "Error: Failed to launch IPFS daemon"; exit 1
+  fi 2>/dev/null
+  declare -rigx daemon_launch_time="${EPOCHSECONDS}"
+  
+  export selfID="$(ipfs config Identity.PeerID)"; cache_peer "/p2p/${selfID}"
+  (# Prime the network with the peers from last session, if any
+    grep -v "/p2p/${selfID}" <<< "${prev_sess_peers}" | xargs -r -n1 ipfs swarm connect
+  # Subscribe to common topics over IPNS pubsub so that peer discovery becomes faster
+    ipfs name resolve --dhtt=1s "$(echo -n IPFS-Chat | ipfs add -n --pin=false -Q)" # App-specific key
+    ipfs bootstrap | grep -o '[[:alnum:]]*$' | xargs -r -n1 ipfs name resolve --dhtt=1s # General key
+  ) &>/dev/null &
+  export topic="$(kdf "ipfs-chat" "${room}")" broadcast="$(kdf "peer-addresses" "${room}")"
+} >&2; export -f ipfs_config
+
+ipfs_config
+
+config(){
+  # Brief: General config. Compute and export variables. Setup tmp dir and runtime filesystem.
+  if ls -d "${IPFS_PATH}/room#"* &>/dev/null; then
+    export nick="$(tail -n1 $(ls -d1 "${IPFS_PATH}/room#"* | head -n1)/pubkey.asc)"
+    echo "Note: Using ${nick} as nick" # Using separate nicks with same peer ID will cause conflicts with IPNS
+  fi
+
+  export enc_key="$(kdf "symmetric-encryption-key" "${room}")" tmpdir="${IPFS_PATH}/room#${topic}"
+  mkdir "${tmpdir}" 2>/dev/null || { echo "Error: Another instance running"; exit 1;}
+  tmpgen(){ mktemp "${tmpdir}/.XXXXX";}; export -f tmpgen
+
+  export chat="${chat:-"${tmpdir}/chat"}"; :>"${chat}" # Redirected no-op to clear file
+  export peers="${tmpdir}/peers"; :>"${peers}" # File must exist for `dialog` to show through its tailbox
+  export peers_buffer="${tmpdir}/peers.buffer" peers_ready="${tmpdir}/peers.ready"
+  export input="${tmpdir}/input" dl_lock="${tmpdir}/dl.lock"
+  export bg_pids="${tmpdir}/background.proc.id.list"
+
+  export code="${tmpdir}/latest_version"
+  [[ "${connect_mode}" != LAN ]] && update -d "${code}" &>/dev/null &
+
+  export cb_wd="${tmpdir}/chatbox.width" # Chatbox width
+  lwrap(){
+    # Brief: Line wrapping to fit our chatbox width
+    # Usage: lwrap [file]
+    # Note: If file is provided, file is folded in-place under lock. Otherwise, stdin to stdout
+    local file="${1}" width="$(($(flock -s "${cb_wd}" cat "${cb_wd}")-5))" # Read lock; note option -s in flock
+    if [[ -n "${file}" ]]; then
+      local buff="$(tmpgen)"
+      fold -s -w "${width}" "${file}" > "${buff}" && flock "${file}" mv "${buff}" "${file}" # In-place, atomic edit
+    else
+      fold -s -w "${width}"
+    fi
+  }; export -f lwrap
+  
+} >&2; export -f config
+
+config
+
+safe_gc(){
+  # Brief: Remove blocks that are not pinned. Difference with `ipfs repo gc` is that this removes only those blocks
+  # that are there when function is called, even if the actual cleanup takes time. Also, can check lock for added safety.
+  # Usage: safe_gc [<lock-file>]
+  # Note: Requires IPFS to be online
+  flock -n 3 || return 1
+  local lock="${1}"
+  if [[ -n "${lock}" ]]; then
+    flock -n "${lock}" ipfs refs local # This doesn't take much time
+  else
+    ipfs refs local
+  fi | xargs -r -n1 ipfs block rm # This is the time consuming part
+} &>/dev/null 3<"${IPFS_PATH}/config"; export -f safe_gc
+
+safe_gc & echo "${!}" >> "${bg_pids}"
+
+identity(){
+  # Brief: Generate key-pair. Claim nick & pubkey using IPNS.
+  export GNUPGHOME="${IPFS_PATH}/gpg" pubkey="${tmpdir}/pubkey.asc" peer_kbx="${tmpdir}/peer.kbx"
+  gnupg(){ flock "${GNUPGHOME}" gpg --batch -q --always-trust "${@}";}; export -f gnupg # Thread-safe gpg in batch mode
+  if mkdir "${GNUPGHOME}"; then
+    gnupg --gen-key << EOF
+  %no-protection
+  Key-Type: EDDSA
+    Key-Curve: ed25519
+  Subkey-Type: ECDH
+    Subkey-Curve: cv25519
+  Name-Real: ${selfID}
+  Expire-Date: 0
+EOF
+    (($? == 0)) || return 1
+    gnupg -a -o "${GNUPGHOME}/pubkey.asc" --export "${selfID}"
+  fi
+  cat "${GNUPGHOME}/pubkey.asc" <(echo "${nick}") > "${pubkey}"
+  ipfs name publish --allow-offline --ipns-base=b58mh "/ipfs/$(ipfs add -Q "${pubkey}")" & # Claim nick & pubkey using IPNS
+} &>/dev/null; export -f identity
+
+identity || { echo "Error: Failed to generate key-pair" >&2; exit 1;}
+
+on_exit(){
+  # Brief: Perform these tasks on exit; called by trap
+  local pid
+  for pid in $(cat ${bg_pids}); do
+    kill_proc_tree "${pid}" &
+  done
+  rm -rf "${tmpdir}"
+  if ! ls -d ${IPFS_PATH}/room#*; then 
+    gpgconf --kill gpg-agent
+    ipfs shutdown
+  fi
+} &>/dev/null; export -f on_exit
+  
+trap "on_exit" exit
+
+connect_peer(){
+  # Brief: Connect to peer ID or multiaddress provided as argument
+  # TODO: Simplify and economize
+  local input="${1}" peerID="${1##*/}" multiaddress
+  if [[ "${peerID}" == "${selfID}" ]]; then
+    return 0
+  elif [[ "${peerID}" != "${input}" ]]; then
+    multiaddress="${input}"
+  else
+    multiaddress="/p2p/${peerID}"
+  fi
+  if ipfs swarm connect "${multiaddress}"; then
+    # Swarm connect autochecks whether peerID is already connected. If not, only then tries multiaddress
+    for multiaddress in $(ipfs swarm peers | grep "${peerID}"); do
+      cache_peer "${multiaddress}" # Add multiaddress of both peer and any relay it is accessed through
+    done
+  else
+    cache_peer "/p2p/${peerID}"
+    return 1
+  fi
+} &>/dev/null; export -f connect_peer
+
+peer_pubkey_nick(){
+  # Brief: Import pubkey of peer ID or multiaddress passed as argument and output its nick. Flag -n to force IPNS update (nocache).
+  # TODO: TBD: peer_pubkey=CID_peerID
+  # TODO: Optimize performance / eliminate repetitions with lock. Solve sometimes peer_nick not showing
+  local OPTIND=1 opt nocache
+  getopts n opt; [[ "${opt}" == "n" ]] && nocache="--nocache"
+  local multiaddress="${!OPTIND}"
+  local peerID="${multiaddress##*/}" peer_nick
+  connect_peer "${multiaddress}" &
+  local ipfs_path="$(i=0; until ipfs name resolve ${nocache} "/ipns/${peerID}" || ((i>5));do ((i++)); done)"
+  [[ -n "${ipfs_path}" ]] || return 1
+  local peer_pubkey="${tmpdir}/${ipfs_path##*/}"
+  if ! [[ -e "${peer_pubkey}" ]]; then
+    # Check size of file before download to avoid spam. Pubkey is 669 bytes to be exact. Add some grace for nick etc.
+    (("$(ipfs files stat --size "${ipfs_path}" || 1001)" < 1000)) || return 1
+    gnupg --yes --no-default-keyring --keyring "${peer_kbx}" --delete-keys "${peerID}"
+    flock "${peer_pubkey}" ipfs get -o "${peer_pubkey}" "${ipfs_path}" && ipfs pin add "${ipfs_path}" && \
+    gnupg --no-default-keyring --keyring "${peer_kbx}" --import "${peer_pubkey}" || rm -f "${peer_pubkey}"
+  fi &>/dev/null
+  if peer_nick="$(tail -n1 "${peer_pubkey}")"; then
+    [[ -n "${peer_nick}" ]] || return 1 # TODO: Understand how peer_nick can ever be empty
+    local peer_buff="${peer_nick} @${peerID:${#peerID}-6:6}"
+    grep -q -m1 "${peer_buff}" "${peers}" || flock "${peers}" echo "${peer_buff}" >> "${peers}" # Live update of online-peers window
+    flock "${peers_buffer}" echo "${peer_buff}" >> "${peers_buffer}"
+    echo "${peer_buff}"
+  else
+    return 1
+  fi
+} 2>/dev/null ; export -f peer_pubkey_nick
+
+check_mime_type(){
+  # Brief: Checks if mime-type of given file matches with the file extension. If extension is unknown, let it be.
+  # If extension refers to different mime-type, Fail.
+  # Usage: check_mime_type <path> <extension>
+  [[ -v mime_type_check ]] || return 0
+  local mime_type_table="/etc/mime.types" path="${1}" ext="${2##*.}"
+  [[ -f "${mime_type_table}" ]] || return 0 # Perhaps this table exists only in Debian and Ubuntu
+  local mime_frm_ext="$(grep -m1 -w "${ext}" "${mime_type_table}" | awk '{print $1}')"
+  if [[ -n "${mime_frm_ext}" ]]; then
+    local actual_mime="$(file -ib "${path}" | cut -d ';' -f 1)" # -i or --mime is more supported than --mime-type
+    [[ "${actual_mime}" != "${mime_frm_ext}" ]] && [[ "${actual_mime}" =~ ^application/.*$ ]] && \
+      echo ".$(grep -w "${actual_mime}" "${mime_type_table}" | awk '{print $2}')"
+  fi
+} 2>/dev/null; export check_mime_type
+
+file_unpack(){
+  # Brief: Download and decrypt shared file
+  # Usage: file_unpack <file-hash> <IPFS-CID> <filename>
+  # TODO: Ask user for permission to download instead of rejecting for size>max_dl_MB
+  flock -s 3
+  local dec_hash="${1}" cid="${2}" dlpath="${dldir}/${3}"
+  local cache="${global_fs}/${cid}"
+  if ! [[ -f "${cache}" ]]; then
+    ((max_dl_MB < 0)) || (($(ipfs files stat --size /ipfs/"${cid}") < max_dl_MB*1024*1024)) || return 1
+    local buffer="$(tmpgen)"
+    ipfs cat "${cid}" | openssl enc -aes128 -pass pass:"${dec_hash}" -nosalt -a -A -d -out "${buffer}" && \
+      mv "${buffer}" "${cache}" && ipfs pin add "${cid}"
+  fi
+  local mime_ext="$(check_mime_type "${cache}" "${dlpath}")"
+  ln --backup=numbered "${cache}" "${dlpath}${mime_ext}" || \
+    cp --backup=numbered "${cache}" "${dlpath}${mime_ext}"
+} &>/dev/null 3>"${dl_lock}"; export -f file_unpack
+
+subscriber_daemon(){
+  # Brief: Listen to messages at pubsub, decrypt & verify signature, display if ok
+  # TODO: Malicious peer detection and blocking.
+  local timestamp CID peerID readbuff recipID sender buffer="$(tmpgen)" gpg_stderr="$(tmpgen)" prefix
+  while read -r peerID readbuff recipID;do
+    (sender="$(peer_pubkey_nick "${peerID}")" || exit 1 # Note absence of -n flag in peer_pubkey_nick
+    case "${recipID}" in
+      all) 
+        prefix="$(printf '=%.0s' {1..40})"$'\n'
+        gnupg --keyring "${peer_kbx}" --passphrase "${enc_key}" --pinentry-mode loopback -d
+        ;;
+      "${selfID}")
+        prefix='**************Private message***********'$'\n'
+        gnupg --keyring "${peer_kbx}" -d
+        ;;
+      *) exit 1;;
+    esac < <(echo -n "${readbuff}" | base64 -d) > "${buffer}" 2> "${gpg_stderr}" || exit 1
+    grep -iq "Good signature from \"${peerID}\"" "${gpg_stderr}" || exit 1 # Verify authenticity/signature
+    grep -xq '[[:print:]]*' "${buffer}" || exit 1 # Check msg is text only to avoid spam
+    read timestamp dec_hash CID < <(head -n1 "${buffer}" | grep -xE '[[:digit:]]*[[:blank:]]([[:alnum:]+_]*[[:blank:]][[:alnum:]]*)?')
+    timestamp="$(date -d @${timestamp} +"%a %H:%M:%S")" || exit 1
+    prefix="${prefix}${sender} ${timestamp} -- "
+    flock "${chat}" cat <(echo -n "${prefix}") <(tail -n+2 "${buffer}") <(echo -e \\n) | lwrap >> "${chat}"
+    if [[ -n "${dec_hash}" ]]; then
+      [[ "${peerID}" != "${selfID}" ]] || [[ "${recipID}" == "${selfID}" ]] || exit 1
+      eval filename="$(awk NR==2 "${buffer}" | cut -d ' ' -f 3-)" # eval is for quote removal
+      file_unpack "${dec_hash}" "${CID}" "${filename}" || \
+        flock "${chat}" echo -e "Download failed -- ${filename}\n" | lwrap >> "${chat}"
+    fi
+    )&
+  done < <(ipfs pubsub sub "${topic}" | grep --line-buffered -x '[[:alnum:]]*[[:blank:]][[:alnum:]+/=]*[[:blank:]][[:alnum:]]*')
+} &>"${tmpdir}/subscriber_daemon.log"; export -f subscriber_daemon
+
+subscriber_daemon & echo "${!}" >> "${bg_pids}"
+
+pubsub_conn(){
+  # Brief: Connect to multiaddresses that are broadcast over pubsub
+  # TODO: Economize same peerID multiple multiaddress
+  local multiaddress peerID
+  while read -r multiaddress;do
+    peerID="${multiaddress##*/}"
+    [[ "${peerID}" == "${selfID}" ]] || peer_pubkey_nick "${multiaddress}" # TODO: TBD: & (bg) or not?
+  done < <(ipfs pubsub sub "${broadcast}" | grep --line-buffered -x '[[:alnum:]/.:-]*')
+} &>"${tmpdir}/pubsub_conn.log"; export -f pubsub_conn
+
+echo "Status: Launching peer-discovery over pubsub..." >&2; pubsub_conn & echo "${!}" >> "${bg_pids}"
+
+con_cull(){
+  # Brief: Cull all connections except those in the cache, and the connection to relay (if any)
+  # Purpose: Reducing bandwidth usage by killing all irrelevant connections
+  local own_relay="$(ipfs id "${selfID}" -f="<addrs>\n" | grep -o '/p2p/[[:alnum:]]*' | sort -u)"
+  ipfs swarm peers | grep -o '/p2p/[[:alnum:]]*' | grep -vf "${sess_peers}" | grep -vf <(echo "${own_relay}") | \
+    xargs -r -n1 ipfs swarm disconnect
+} &>/dev/null; export -f con_cull
+
+declare -irx ICPDI="${ICPDI:=30}" # IPFS_CHAT_PEER_DISCOVERY_INTERVAL in seconds (type: integer)
+
+peering_daemon(){
+  # Brief: Discover & connect to chat-peers & announce self for others to discover - at regular intervals
+  local peerID
+  local -a dht_ops_pid
+  local -A peerID_list # Associative array
+
+  local -r start_peer_discov="${EPOCHSECONDS}"
+  while :;do
+    dht_ops_pid=() # Stores pid's of background DHT operations executing in the current pass
+    local timestamp="${EPOCHSECONDS}" # Current Unix time
+    local nonce="$(hmac "${broadcast}" "$((timestamp/120))" | ipfs add -Q --stdin-name='Rendezvous')" # Announce time based nonce
+    #ipfs dht provide "${nonce}" & dht_ops_pid+=($!) # TODO: TBD: Isnt `ipfs add` enough? `ipfs dht provide` takes loooong time
+
+    peerID_list=() # Would store peerIDs seen in this pass
+    while read -r -t 5 peerID; do # Connecting to peers and importing their latest pubkeys. Exp: No timeout messes things up
+      ((peerID_list["${peerID}"] != 1)) || continue # peerID handled already, so move on
+      peerID_list["${peerID}"]=1 # Add to list so that other iterations won't handle this peerID again
+      peer_pubkey_nick -n "${peerID}" &>/dev/null & dht_ops_pid+=($!) # Notice the nocache flag -n forcing IPNS update      
+    done < <(cat <(ipfs pubsub peers "${topic}") <(ipfs pubsub peers "${broadcast}") <(timeout 5.5 ipfs dht findprovs "${nonce}"))
+    # Makes things concurrent. Note: Without the `ipfs dht` timeout, `ps` would be replete with older `cat` and `ipfs dht`
+
+    [[ -n "${dht_ops_pid}" ]] && wait "${dht_ops_pid[@]}" # Wait till all DHT operations are complete
+    ipfs id "${selfID}" -f="<addrs>\n" | grep -vf <(ipfs diag sys | jq -r .net.interface_addresses[]) | \
+      ipfs pubsub pub "${broadcast}" # Announce own public multiaddresses over pubsub
+    ipfs pin rm "${nonce}" &>/dev/null & # Otherwise reprovider will continue announcing stale nonce. Pin still necessary to save from auto-GC
+    flock "${peers_buffer}" sort -uo "${peers_buffer}" "${peers_buffer}" && mv "${peers_buffer}" "${peers_ready}" # In-place sort followed by atomic move. -u defends against peers_buffer containing repetitions
+    if ((EPOCHSECONDS-start_peer_discov > 30)); then
+      con_cull & # Need for DHT is over for now. So, let's cull unnecessary connections to reduce bandwidth usage.
+      safe_gc "${dl_lock}" & # Remove irrelevant blocks in bg
+      # Lockfile makes sure this is not run during file download, as otherwise downloaded but yet unpinned blocks might be GCd
+      sleep "$((ICPDI-EPOCHSECONDS+timestamp))" 2>/dev/null # Redirection for when the sleep time is negative
+    else
+      continue # For the initial 30s after launch be relentless in peer discovery. No culling, no GC.
+    fi
+  done  
+} &>"${tmpdir}/peering_daemon.log"; export -f peering_daemon
+
+echo "Status: Launching peer-discovery over DHT..." >&2; peering_daemon & echo "${!}" >> "${bg_pids}"
+
+file_pack(){
+  # Brief: Encrypt file with its salted hash, add to IPFS & output CID and encrypt key
+  # Usage: file_pack <file containing the path of the file to be shared> # This is just for simplicity of `send` code below
+  # This function also replaces the path present in the given file with just the filename
+  local msg="${1}" path filename
+  path="$(win2lin_path < "${msg}")"
+  if [[ -f "${path}" ]]; then
+    filename="${path##*/}"
+  elif [[ -d "${path}" ]]; then
+    local dir="${path}"; path="$(tmpgen)"
+    local dirname="${dir##*/}"
+    (cd "${dir}"/.. ; tar -czf "${path}" "${dirname}") # This trick makes sure tar -xzf gives only the desired directory, not its parents
+    filename="${dirname}.tar.gz"
+  else
+    return 0    
+  fi
+  local enc_hash="$(sha1sum -b "${path}" | cut -d' ' -f1 | b64)"
+  if ! grep -m1 "${enc_hash}" "${sess_uplds}"; then
+    local cache="${global_fs}/${enc_hash}"
+    [[ -f "${cache}" ]] || openssl enc -aes128 -pass pass:"${enc_hash}" -nosalt -a -A -in "${path}" -out "${cache}"
+    local hlink="$(tmpgen)"; ln -f "${cache}" "${hlink}"
+    # This is necessary for ipfs add --nocopy below; otherwise ipfs add fails if cache is outside "${IPFS_PATH}/.."
+    ((max_dl_MB < 0)) || (("$(wc -c "${hlink}" | cut -d ' ' -f1)" < max_dl_MB*1024*1024)) || return 1
+    echo "${enc_hash} $(ipfs add --nocopy --fscache -Q "${hlink}")" | flock "${sess_uplds}" tee -a "${sess_uplds}"
+  fi
+  # Openssl with -nosalt instead of GPG, because GPG or Openssl -salt encryption is time dependent
+  echo -n "Sent file: \"${filename}\"" > "${msg}"
+} 2>/dev/null; export -f file_pack
+
+send(){
+  # Brief: Encrypt and sign user's msg & publish to pubsub
+  [[ -s "${input}" ]] || return # Skip empty input
+  local msg="$(tmpgen)" recipID="all"
+  local first_word="$(cut -z -d ' ' -f 1 "${input}")"
+  if [[ "${first_word}" =~ ^@[[:alnum:]]{6}$ ]]; then
+    recipID="$(grep -Eom1 "[[:alnum:]]*${first_word/@/}$" "${sess_peers}")"
+    cut -d ' ' -f 2- "${input}" | tr -d $'\n' > "${msg}"
+    grep -xq "${first_word}" "${msg}" && return # Skip empty input
+    local prefix="PM to $(grep -m1 "${first_word}" "${peers}") $(date +"%a %H:%M:%S") -- "
+  else  
+    mv "${input}" "${msg}"
+  fi
+  (
+  if enc_hash_cid="$(file_pack "${msg}")"; then
+    buffer="$(cat <(echo "${EPOCHSECONDS} ${enc_hash_cid}") "${msg}" | \
+      case "${recipID}" in
+        all) gnupg --passphrase "${enc_key}" --pinentry-mode loopback -s -c --cipher-algo AES128;;
+        *) peer_pubkey_nick "${recipID}" >/dev/null ; gnupg --keyring "${peer_kbx}" -s -r "${recipID}" -e;;
+      esac | base64 -w0)"
+    ipfs pubsub pub "${topic}" <<< "${selfID} ${buffer} ${recipID}"
+  else
+    prefix="Failed to send -- "
+  fi
+  [[ -v prefix ]] && flock "${chat}" cat <(echo -n "${prefix}") "${msg}" <(echo -e \\n) | lwrap >> "${chat}"
+  ) &
+} &>/dev/null; export -f send
+
+ui(){
+  # Brief: UI event-loop. Window numbering: 1(Top Left) 2(Top Right) 3(Spanning Bottom)
+    local PM_buffer="$(tmpgen)" txt_buffer="$(tmpgen)"
+    local input_help="\Zb\Z4Nick: \Zu\Z0${nick}\Zn \Zb\Z4peerID: \Zu\Z0@${selfID:${#selfID}-6:6}\Zn
+\Zb\Z4General-Message:\Z1 Type, then \Z4Send\Z1 (or press \Z4Enter\Z1)\Zn
+\Zb\Z4Fle-sharing:\Z2 Drag-n-drop file/directory, or use \Z4Explorer\Zn
+\Zb\Z4Private-Message:\Z5 Select peer using \Z4PM\Z5, then type and \Z4Send\Zn"
+    local chat_title="Room: ${room}"
+    local peers_title="Online-peers"
+    local peering_mode="\Zb\Z4${connect_mode:-"WAN+LAN"}\Zn"
+
+  while :;do
+    # Dimensions are computed just before calling `dialog` to accomodate for the latest terminal window size changes
+    local tty_height="$(tput lines)" tty_width="$(tput cols)"
+    local win3_height=10 win3_width="${tty_width}"
+    local win12_height="$((tty_height-win3_height-1))" # The -1 gap looks awesome as it demarcates better
+    local win2_width="$((tty_width/4))"
+    local win1_width="$((tty_width-win2_width))"
+    if ((win1_width != last_win1_width)); then
+      flock -x "${cb_wd}" echo "${win1_width}" > "${cb_wd}" # Write lock; note option -x in flock
+      lwrap "${chat}"
+      local last_win1_width="${win1_width}"
+    fi # Conditionality decreases lag between pressing Send and subsequent chatbox update
+
+    DIALOG_CANCEL=4 dialog --keep-tite \
+      --title "${chat_title}" --begin 0 0 --tailboxbg "${chat}" "${win12_height}" "${win1_width}" \
+      --and-widget --colors --hline "${peering_mode}" \
+      --title "${peers_title}" --begin 0 "${win1_width}" --tailboxbg "${peers}" "${win12_height}" "${win2_width}" \
+      --and-widget --colors \
+      --no-shadow --title "Press Esc to exit" --begin "$((tty_height-win3_height))" 0 \
+      --ok-label "Send" --cancel-label "Explorer" \
+      --extra-button --extra-label "Chat" \
+      --help-button --help-label "PM" \
+      --inputbox "${input_help}" "${win3_height}" "${win3_width}" "$(cat "${PM_buffer}" "${txt_buffer}")" \
+      2> "${input}"
+      local exit_code=$?
+
+      mv -f "${peers_ready}" "${peers}" &>/dev/null # Refresh online-peers
+
+      case "${exit_code}" in
+        0) # Button: Send
+           send 
+           : > "${PM_buffer}"; : > "${txt_buffer}"
+           ;;
+        2) # Button: PM
+           sed -E s/^@[[:alnum:]]{6}[[:blank:]]?// "${input}" > "${txt_buffer}" # Put anything except recipID in buffer
+           dialog --keep-tite --no-shadow --colors --hline "${peering_mode}" --exit-label "Back" --ok-label "Select" \
+           --title "${peers_title}" --begin 0 0 --menu "Choose peer" "${tty_height}" "${tty_width}" "${tty_height}" \
+           $(awk '{print $2,$1}' "${peers}") 2> "${PM_buffer}" &&  echo -n ' ' >> "${PM_buffer}"
+           ;;
+        3) # Button: Chat
+           dialog --keep-tite --no-shadow --scrollbar --exit-label "Back" \
+           --title "${chat_title}" --begin 0 0 --textbox "${chat}" "${tty_height}" "${tty_width}"
+           : > "${PM_buffer}"; : > "${txt_buffer}"
+           ;;
+        4) # Button: Explorer
+           dialog --keep-tite --colors --begin 0 0 \
+           --title "Help: \Z1Tab\Zn for choosing window; \Z1Spacebar\Zn for autocomplete or select/copy" \
+           --fselect "${PWD}/" "${win12_height}" "${tty_width}" 2> "${txt_buffer}"
+           ;;
+        1 | *) # Ctrl-C or Esc
+           local confirm_quit="Shared file download is in progress. Still wanna quit?"
+           if ! flock -n "${dl_lock}" -c : ; then
+            # Check if dl_lock is held by file_unpack or safe_gc. In the latter case, return without prompt.
+            if flock -s "${dl_lock}" -c : ; then
+              # Read lock could be acquired, hence it must be file_unpack that's holding dl_lock
+              dialog --keep-tite --yesno "${confirm_quit}" "$(tput lines)" "$(tput cols)" && return "${exit_code}"
+            else
+              return "${exit_code}" # Lock held by safe_gc
+            fi
+           else
+            return "${exit_code}"
+           fi
+           ;;
+      esac
+  done
+}; export -f ui
+
+echo "Status: Launching UI...(If it takes a long time to open, try pressing Enter)" >&2; ui
+
+[[ -v disable_bandwidth_metrics ]] && \
+  echo -e "Stats: $(ipfs stats bw | head -n3)\nTime: $((EPOCHSECONDS-daemon_launch_time))s" >&2
+
+if [[ -x "${code}" ]] && updateto="$(${code} -v 2>/dev/null)" && [[ "${updateto}" != "${version}" ]]; then
+  confirm_update="Update ipfs-chat from v${version} to v${updateto}?"
+  dialog --keep-tite --yesno "${confirm_update}" "$(tput lines)" "$(tput cols)" && update -s "${code}"
+fi
+
+echo "Status: Exiting..." >&2
+
+exit

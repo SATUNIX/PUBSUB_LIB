@@ -1,0 +1,15 @@
+File Operation Logger write: chat_dapp_library.md #25724368575e6780b5cf5e97a5516365
+write: view_model.md #7248b153055ab5d6f6769878d5d7cdab
+write: deploy_chat_dapp.md #aa7d03f09f4d1334799d278bf2020e1d
+write: implement_pubsub.md #9b22858893987b09869849c66ef51083
+write: go_program.md #153603bd01c6b8f7c77ad5b39c98a979
+write: documentation.md #3ee9bbf47ba6e8f968346d3c96a2e979
+write: setup_instructions.md #c44dbce56c9bff7f07df6e502093e9a7
+write: basic_libp2p_host.go #f26632b31475a1b5656404fdac725e6b
+write: pubsub_service_initialization.go #1dc1c76a1575f052f197bb195beea6fd
+write: topic_subscription_message_handling.go #6f74a89692055f3797caa2a10a86a63a
+write: message_publishing.go #4ffee0c89590591b2eb6f62046c19de1
+write: simple_cli.go #2743bbc3feca153a3bf53b7dd70f677f
+write: mdns_integration.go #69c942a8daaeb2f62818e8e54a6539d7
+write: error_handling_and_logging.go #21c7ac5a68176d49b554b87cca44c09b
+write: decentralized_messaging_test.go #a3ae3ffe5160692c5f4e8795ed5ba559
