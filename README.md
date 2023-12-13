@@ -24,7 +24,9 @@ This repository is created to facilitate the development life cycle of messaging
 8. Able to integrate directly into Dangerous Net and future Dangerous Net clustering service. 
 
 
+## For developers 
 
+1. See the latest files / commited files in commit history and or find it in the code list. as of 12/13/23 this is /IPFS_CHAT4/
 
 ## Acknowledgements 
 1. The libp2p framework and libraries:
