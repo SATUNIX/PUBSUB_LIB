@@ -36,3 +36,43 @@ This repository is created to facilitate the development life cycle of messaging
 3. RSA
 ![image](https://github.com/SATUNIX/PUBSUB_LIB/assets/111553838/ac1a6815-50bb-48ee-acaa-18291e6eb137)
 
+
+## Below for theorised IPFS implementation instead of libp2p:
+Key Components of the Go Program:
+IPFS Initialization and Configuration:
+
+Use the Go ipfs-http-client library to interact with an IPFS node.
+Initialize the IPFS node with low-power and random port profiles.
+Configure IPFS settings like PubSub, IPNS, and filestore.
+Key Generation and Identity Management:
+
+Utilize cryptographic libraries in Go to generate GPG key pairs.
+Use IPNS to publish the public key and user nickname.
+Message Publishing (Sending):
+
+Implement a function to read user input.
+Encrypt messages using the recipient's public key for private messages.
+Use IPFS PubSub (ipfs pubsub pub) to publish messages.
+Message Subscription (Receiving):
+
+Create a background process to listen for new messages on the IPFS PubSub topic (ipfs pubsub sub).
+Decrypt and authenticate incoming messages.
+File Sharing:
+
+Implement file encryption and add encrypted files to IPFS.
+Share the CID and encryption key of the file with other users.
+Peer Discovery and Connection:
+
+Use IPFS's PubSub system for discovering peers.
+Implement functionality to connect to peers (ipfs swarm connect).
+UI and Interaction:
+
+Since Go doesn't have native support for dialog-based UI, consider using a web-based interface or a command-line interface.
+Dependency Checks and Path Conversion:
+
+Ensure all dependencies are installed.
+Implement path conversion functions for cross-platform compatibility.
+Network Configuration and Cleanup:
+
+Configure network settings for different modes (LAN/WAN).
+Implement cleanup operations for shutting down the application.
